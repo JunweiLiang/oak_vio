@@ -42,10 +42,16 @@ def main():
 
     # 3. Setup hardware-accelerated video encoding on the OAK-D
     if args.mp4:
+        # FIX: Force the camera to Planar mode so SpectacularAI doesn't crash with RGB888i
+        vio_pipeline.color.setInterleaved(False)
+        vio_pipeline.color.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+
         video_enc = pipeline.create(dai.node.VideoEncoder)
         video_enc.setDefaultProfilePreset(30, dai.VideoEncoderProperties.Profile.H264_MAIN)
-        vio_pipeline.color.video.link(video_enc.input)
-        
+
+        # FIX: Link the 'isp' output instead of 'video' for better encoder compatibility
+        vio_pipeline.color.isp.link(video_enc.input)
+
         xout_video = pipeline.create(dai.node.XLinkOut)
         xout_video.setStreamName("video_out")
         video_enc.bitstream.link(xout_video.input)
@@ -57,7 +63,7 @@ def main():
     video_file = None
 
     print("Initializing OAK-D device...")
-    
+
     # 4. Main Application Loop
     with dai.Device(pipeline) as device:
         while state != "QUIT":
@@ -73,9 +79,11 @@ def main():
                         state = "MAPPING"
                         # Start the session only when 's' is pressed
                         vio_session = vio_pipeline.startSession(device)
-                        
+
                         if args.mp4:
                             video_queue = device.getOutputQueue(name="video_out", maxSize=30, blocking=False)
+                            # Clear old frames that buffered before 's' was pressed
+                            video_queue.getAll()
                             video_file = open(args.mp4, 'wb')
                             print(f"Recording video to {args.mp4}")
                             

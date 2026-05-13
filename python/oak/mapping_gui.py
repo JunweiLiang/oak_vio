@@ -35,22 +35,24 @@ def main():
     config.useSlam = True
     config.mapSavePath = args.map_location
     
-    if args.mp4:
-        config.useColor = True
+    # Do NOT set config.useColor = True. Let SpectacularAI map using the
+    # Stereo Mono cameras. This avoids format clashes and provides better SLAM.
 
     vio_pipeline = spectacularAI.depthai.Pipeline(pipeline, config)
 
-    # 3. Setup hardware-accelerated video encoding on the OAK-D
+    # 3. Setup completely independent RGB Video Recording
     if args.mp4:
-        # FIX: Force the camera to Planar mode so SpectacularAI doesn't crash with RGB888i
-        vio_pipeline.color.setInterleaved(False)
-        vio_pipeline.color.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+        # Create a dedicated Color Camera node just for the VideoEncoder
+        camRgb = pipeline.create(dai.node.ColorCamera)
+        camRgb.setBoardSocket(dai.CameraBoardSocket.RGB)
+        camRgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+        camRgb.setFps(30)
 
         video_enc = pipeline.create(dai.node.VideoEncoder)
         video_enc.setDefaultProfilePreset(30, dai.VideoEncoderProperties.Profile.H264_MAIN)
 
-        # FIX: Link the 'isp' output instead of 'video' for better encoder compatibility
-        vio_pipeline.color.isp.link(video_enc.input)
+        # .video output natively provides NV12 format, making the encoder happy
+        camRgb.video.link(video_enc.input)
 
         xout_video = pipeline.create(dai.node.XLinkOut)
         xout_video.setStreamName("video_out")
@@ -66,6 +68,12 @@ def main():
 
     # 4. Main Application Loop
     with dai.Device(pipeline) as device:
+
+        # FIX: Open queue immediately to prevent device-side blocking!
+        if args.mp4:
+            video_queue = device.getOutputQueue(name="video_out", maxSize=30, blocking=False)
+            video_file = open(args.mp4, 'wb')
+
         while state != "QUIT":
             screen.fill(BG_COLOR)
 
@@ -75,23 +83,19 @@ def main():
                     state = "QUIT"
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_s and state == "WAITING":
-                        print("Mapping started.")
+                        print(f"Mapping started. Recording to {args.mp4 if args.mp4 else 'None'}")
                         state = "MAPPING"
-                        # Start the session only when 's' is pressed
                         vio_session = vio_pipeline.startSession(device)
 
-                        if args.mp4:
-                            video_queue = device.getOutputQueue(name="video_out", maxSize=30, blocking=False)
-                            # Clear old frames that buffered before 's' was pressed
-                            video_queue.getAll()
-                            video_file = open(args.mp4, 'wb')
-                            print(f"Recording video to {args.mp4}")
-                            
                     elif event.key == pygame.K_q:
                         state = "QUIT"
 
             # State Logic & Rendering
             if state == "WAITING":
+                # FIX: Constantly drain the video queue so the camera pipeline doesn't freeze
+                if args.mp4 and video_queue.has():
+                    video_queue.getAll()
+
                 draw_text(screen, font, "READY TO MAP", 20, 20)
                 draw_text(screen, font, f"Map will be saved to: {args.map_location}", 20, 60)
                 draw_text(screen, font, "[S] - Start Mapping", 20, 120, (100, 255, 100))
@@ -101,21 +105,18 @@ def main():
                 # Fetch tracking data
                 if vio_session.hasOutput():
                     out = vio_session.getOutput()
-                    
-                    # OAK-D standard coordinates: X is right, Y is down, Z is forward.
-                    # For a top-down view, we map X to screen X, and Z to screen Y.
+
                     px = int(WIDTH / 2 + out.pose.position.x * SCALE)
                     py = int(HEIGHT / 2 - out.pose.position.z * SCALE)
-                    
-                    # Only add point if it moved a bit (prevents rendering too many stacked points)
+
                     if not trajectory or (abs(trajectory[-1][0] - px) > 1 or abs(trajectory[-1][1] - py) > 1):
                         trajectory.append((px, py))
 
-                # Fetch and save encoded video frames
-                if args.mp4 and video_queue is not None and video_queue.has():
+                # Save encoded video frames only while mapping
+                if args.mp4 and video_queue.has():
                     while video_queue.has():
-                        video_packet = video_queue.get()
-                        video_packet.getData().tofile(video_file)
+                        packet = video_queue.get()
+                        packet.getData().tofile(video_file)
 
                 # UI Overlay
                 draw_text(screen, font, "MAPPING IN PROGRESS (● REC)", 20, 20, (255, 50, 50))
@@ -125,21 +126,19 @@ def main():
                 # Draw the camera trajectory
                 if len(trajectory) > 1:
                     pygame.draw.lines(screen, TRAJ_COLOR, False, trajectory, 2)
-                
+
                 # Draw current position indicator
                 if trajectory:
                     pygame.draw.circle(screen, POINT_COLOR, trajectory[-1], 6)
 
             pygame.display.flip()
-            
-            # Cap framerate to 60 FPS to avoid burning CPU
             clock.tick(60)
 
     # 5. Cleanup and Serialization
     print("\nShutting down...")
     if vio_session:
         print(f"Serializing map to {args.map_location}...")
-        vio_session.close() # Explicitly closing triggers the map save
+        vio_session.close()
         
     if video_file:
         video_file.close()
